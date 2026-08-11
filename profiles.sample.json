@@ -1,0 +1,37 @@
+{
+  "settings": {
+    "vncViewerPath": "$env:ProgramFiles\\TigerVNC\\vncviewer.exe",
+    "defaultRdpPort": 3389,
+    "defaultVncPort": 5900,
+    "manageSshAgent": true,
+    "sshWindowStyle": "Normal"
+  },
+  "profiles": {
+    "win-rdp": {
+      "type": "rdp",
+      "host": "192.168.1.50",
+      "port": 3389
+    },
+    "win-rdp-file": {
+      "type": "rdp",
+      "rdpFile": "$HOME\\.rlauncher\\win-rdp.rdp"
+    },
+    "linux-vnc-direct": {
+      "type": "vnc",
+      "host": "192.168.1.60",
+      "port": 5900,
+      "passwdFile": "$HOME\\.vnc\\linux-passwd"
+    },
+    "linux-vnc-tunnel": {
+      "type": "vnc-tunnel",
+      "sshHost": "user@linux.example.local",
+      "sshPort": 22,
+      "remoteHost": "localhost",
+      "remotePort": 5901,
+      "localPort": 5901,
+      "passwdFile": "$HOME\\.vnc\\linux-passwd",
+      "identityFile": "$HOME\\.ssh\\id_ed25519",
+      "manageSshAgent": true
+    }
+  }
+}

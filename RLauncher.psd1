@@ -4,7 +4,7 @@
     GUID              = '228f8ac8-df8d-483d-ad53-d5fb5d8b0443'
     Author            = 'MATSUOKA Hiroshi <matsuboyjr@gmail.com>'
     Copyright         = 'Copyright (c) 2026 MATSUOKA Hiroshi <matsuboyjr@gmail.com>. Licensed under the MIT License.'
-    Description       = 'Manage RDP, VNC, and VNC over SSH tunnel connection profiles on Windows.'
+    Description       = 'Manage RDP and VNC, directly or over SSH tunnel connection profiles on Windows.'
     PowerShellVersion = '5.1'
 
     FunctionsToExport = @(

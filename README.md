@@ -1,6 +1,6 @@
 # RLauncher
 
-RLauncher is a small PowerShell module for managing RDP, VNC, and VNC over SSH tunnel connection profiles on Windows. It uses the built-in Windows OpenSSH Client (`ssh.exe` and `ssh-agent`), requires no WSL, and is compatible with Windows PowerShell 5.1.
+RLauncher is a small PowerShell module for managing RDP and VNC, directly or over SSH tunnel connection profiles on Windows. It uses the built-in Windows OpenSSH Client (`ssh.exe` and `ssh-agent`), requires no WSL, and is compatible with Windows PowerShell 5.1.
 
 ## Installation
 
@@ -52,6 +52,14 @@ Set the TigerVNC Viewer path once in `settings.vncViewerPath`. Local file paths 
       "type": "rdp",
       "rdpFile": "$HOME\\.rlauncher\\win-rdp.rdp"
     },
+    "win-rdp-tunnel": {
+      "type": "rdp-tunnel",
+      "sshHost": "user@bastion.example.local",
+      "remoteHost": "192.168.1.50",
+      "remotePort": 3389,
+      "localPort": 13389,
+      "rdpFile": "$HOME\\.rlauncher\\win-rdp.rdp"
+    },
     "linux-vnc-direct": {
       "type": "vnc",
       "host": "192.168.1.60",
@@ -90,6 +98,7 @@ When the profile name is omitted, `Connect-RLauncher` validates the configuratio
 Connect-RLauncher
 Connect-RLauncher win-rdp
 Connect-RLauncher win-rdp-file
+Connect-RLauncher win-rdp-tunnel
 Connect-RLauncher linux-vnc-direct
 Connect-RLauncher linux-vnc-tunnel
 ```
@@ -97,6 +106,12 @@ Connect-RLauncher linux-vnc-tunnel
 For RDP, RLauncher starts either `mstsc.exe <rdpFile>` or `mstsc.exe /v:host:port`.
 
 For VNC over SSH, it starts `ssh.exe -N -L localPort:remoteHost:remotePort sshHost`, waits for `127.0.0.1:localPort`, and starts VNC Viewer once. If `sshPort` is configured, it adds `-p sshPort`. When VNC Viewer exits, RLauncher stops only the SSH process that it started.
+
+For RDP over SSH (`rdp-tunnel`), `sshHost` and `localPort` are required. The SSH server connects to `remoteHost` (default `127.0.0.1`); `remotePort` uses the profile value, then `settings.defaultRdpPort`, then `3389`. For a separate bastion, set `remoteHost` to the RDP server address reachable from that bastion. `host` and `port` are not used by tunnel profiles.
+
+RLauncher binds RDP forwarding to `127.0.0.1:localPort`, waits up to 10 seconds for the port, then runs `mstsc.exe /v:127.0.0.1:localPort`. An optional `rdpFile` is passed before `/v` to retain saved display and redirection settings; the original file is not edited. The SSH destination always comes from JSON, not the file. Paths containing spaces or non-ASCII characters are supported. This supports ordinary desktop RDP files; RD Gateway, RemoteApp, and connection-broker configurations are outside this feature's scope.
+
+`Connect-RLauncher` waits for the tunnel client to exit (including descendants for RDP), then stops only the SSH process it created. It also cleans up if client startup or tunnel readiness fails. An occupied local port is an error and is never reused. Direct RDP connections still return immediately. Keep the PowerShell session open while using a tunnel; forcibly terminating PowerShell can prevent cleanup. Use a distinct `localPort` for each simultaneous tunnel.
 
 SSH uses a visible normal window by default so password, passphrase, and first-time host-key prompts remain visible. Set `settings.sshWindowStyle` or the profile-level `sshWindowStyle` to `"Hidden"` when prompts are not needed.
 
@@ -108,7 +123,7 @@ Connect-RLauncher linux-vnc-tunnel -Verbose
 
 ## ssh-agent
 
-RLauncher manages `ssh-agent` only for `vnc-tunnel` profiles. `settings.manageSshAgent` defaults to `true`, and a profile-level setting takes precedence. You may omit `sshPort` when it is defined by an SSH config alias. The `user@host:2222` syntax is not supported in `sshHost`.
+RLauncher manages `ssh-agent` for `vnc-tunnel` and `rdp-tunnel` profiles. `settings.manageSshAgent` defaults to `true`, and a profile-level setting takes precedence. You may omit `sshPort` when it is defined by an SSH config alias. The `user@host:2222` syntax is not supported in `sshHost`.
 
 To start `ssh-agent` automatically with Windows, optionally run the following from an elevated PowerShell session. RLauncher does not change the service startup type automatically.
 
@@ -145,6 +160,15 @@ With Pester 5 installed, run the unit tests. They do not establish real remote c
 ```powershell
 Invoke-Pester .\Tests -Output Detailed
 ```
+
+For an end-to-end RDP tunnel check, use a reachable SSH/RDP test server:
+
+1. Connect with `rdp-tunnel` without `rdpFile`, then with a file whose saved destination differs from the JSON target. Confirm both reach the JSON target and the file's display/redirection settings are retained.
+2. Repeat with an existing RDP window open. Closing the new client must release its tunnel port without interrupting the existing window or unrelated SSH processes.
+3. Repeat with paths containing spaces and non-ASCII characters. Verify the source `.rdp` file is unchanged.
+4. Occupy `localPort` before connecting; confirm the command reports an error without starting RDP.
+
+These live checks require credentials and a reachable server; the Pester suite uses mocked clients and does not establish remote sessions.
 
 ## License
 

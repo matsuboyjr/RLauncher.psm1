@@ -1,7 +1,10 @@
+BeforeDiscovery {
+    Import-Module (Join-Path (Split-Path -Parent $PSScriptRoot) 'RLauncher.psd1') -Global
+}
+
 BeforeAll {
     $moduleRoot = Split-Path -Parent $PSScriptRoot
     $manifestPath = Join-Path $moduleRoot 'RLauncher.psd1'
-    Import-Module $manifestPath -Force
 }
 
 Describe 'RLauncher module manifest' {

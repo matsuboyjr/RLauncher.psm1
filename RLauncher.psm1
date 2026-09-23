@@ -28,6 +28,14 @@ function Get-RemoteProfileSampleJson {
       "type": "rdp",
       "rdpFile": "$HOME\\.rlauncher\\win-rdp.rdp"
     },
+    "win-rdp-tunnel": {
+      "type": "rdp-tunnel",
+      "sshHost": "user@bastion.example.local",
+      "remoteHost": "192.168.1.50",
+      "remotePort": 3389,
+      "localPort": 13389,
+      "rdpFile": "$HOME\\.rlauncher\\win-rdp.rdp"
+    },
     "linux-vnc-direct": {
       "type": "vnc",
       "host": "192.168.1.60",
@@ -418,11 +426,45 @@ function Ensure-SshAgent {
         }
 
         Ensure-Command -CommandName 'ssh-add.exe' | Out-Null
-        $process = Start-Process -FilePath 'ssh-add.exe' -ArgumentList @($expandedIdentityFile) -NoNewWindow -Wait -PassThru
+        $process = Start-Process -FilePath 'ssh-add.exe' -ArgumentList @(ConvertTo-RLauncherNativeArgument -Value $expandedIdentityFile) -NoNewWindow -Wait -PassThru -ErrorAction Stop
         if ($process.ExitCode -ne 0) {
             throw "ssh-add failed for identityFile: $(Format-RLauncherPathForMessage -OriginalPath $IdentityFile -ExpandedPath $expandedIdentityFile)"
         }
     }
+}
+
+function ConvertTo-RLauncherNativeArgument {
+    param([Parameter(Mandatory = $true)] [AllowEmptyString()] [string] $Value)
+
+    # Start-Process joins ArgumentList with spaces; quote using Windows argv rules.
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+    $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
+}
+
+function Resolve-TunnelRemotePort {
+    param([object] $Config, [object] $Profile)
+
+    $isRdp = (Get-ObjectPropertyValue $Profile 'type') -eq 'rdp-tunnel'
+    $field = if ($isRdp) { 'defaultRdpPort' } else { 'defaultVncPort' }
+    $fallback = if ($isRdp) { 3389 } else { 5900 }
+    $settings = Get-ObjectPropertyValue $Config 'settings'
+    Resolve-ProfilePort -ProfilePort (Get-ObjectPropertyValue $Profile 'remotePort') -DefaultPort (Get-ObjectPropertyValue $settings $field) -FallbackPort $fallback -FieldName 'remotePort'
+}
+
+function Assert-RLauncherLocalPortAvailable {
+    param([Parameter(Mandatory = $true)] [int] $Port)
+
+    $listener = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Loopback), $Port
+    try {
+        $listener.Server.ExclusiveAddressUse = $true
+        $listener.Start()
+    }
+    catch {
+        throw "Local port 127.0.0.1:$Port is unavailable. Choose a different localPort. $($_.Exception.Message)"
+    }
+    finally { $listener.Stop() }
 }
 
 function Start-SshTunnel {
@@ -441,15 +483,18 @@ function Start-SshTunnel {
     $identityFile = Get-ObjectPropertyValue -InputObject $Profile -Name 'identityFile'
 
     if ([string]::IsNullOrWhiteSpace([string]$sshHost)) {
-        throw "vnc-tunnel profile requires sshHost."
+        throw "SSH tunnel profile requires sshHost."
     }
 
     if ([string]::IsNullOrWhiteSpace([string]$localPort)) {
-        throw "vnc-tunnel profile requires localPort."
+        throw "SSH tunnel profile requires localPort."
     }
 
     $localPortNumber = Assert-Port -Port $localPort -FieldName 'localPort'
     $forward = ('{0}:{1}:{2}' -f $localPortNumber, $remoteHost, $RemotePort)
+    if ((Get-ObjectPropertyValue $Profile 'type') -eq 'rdp-tunnel') {
+        $forward = '127.0.0.1:' + $forward
+    }
     $arguments = @('-N', '-o', 'ExitOnForwardFailure=yes', '-L', $forward)
 
     if ($null -ne $sshPort -and [string]$sshPort -ne '') {
@@ -466,10 +511,11 @@ function Start-SshTunnel {
     }
 
     $arguments += [string]$sshHost
+    $arguments = @($arguments | ForEach-Object { ConvertTo-RLauncherNativeArgument -Value $_ })
 
     try {
         Write-Verbose ("Starting SSH tunnel: ssh.exe {0}" -f ($arguments -join ' '))
-        return Start-Process -FilePath 'ssh.exe' -ArgumentList $arguments -PassThru -WindowStyle $WindowStyle
+        return Start-Process -FilePath 'ssh.exe' -ArgumentList $arguments -PassThru -WindowStyle $WindowStyle -ErrorAction Stop
     }
     catch {
         throw "Failed to start SSH tunnel. Command: ssh.exe $($arguments -join ' ')`n$($_.Exception.Message)"
@@ -479,43 +525,48 @@ function Start-SshTunnel {
 function Start-RdpConnection {
     param(
         [Parameter(Mandatory = $true)] [object] $Config,
-        [Parameter(Mandatory = $true)] [object] $Profile
+        [Parameter(Mandatory = $true)] [object] $Profile,
+        [string] $HostName,
+        [int] $Port,
+        [switch] $Wait
     )
 
     Ensure-Command -CommandName 'mstsc.exe' | Out-Null
 
     $rdpFile = Get-ObjectPropertyValue -InputObject $Profile -Name 'rdpFile'
+    $arguments = @()
     if (-not [string]::IsNullOrWhiteSpace([string]$rdpFile)) {
         $expandedRdpFile = Expand-RLauncherPath -Path $rdpFile -FieldName 'rdpFile'
         if (-not (Test-Path -LiteralPath $expandedRdpFile -PathType Leaf)) {
             throw "rdpFile was specified but does not exist: $(Format-RLauncherPathForMessage -OriginalPath $rdpFile -ExpandedPath $expandedRdpFile)"
         }
 
-        try {
-            Start-Process -FilePath 'mstsc.exe' -ArgumentList @([string]$expandedRdpFile)
-            return
-        }
-        catch {
-            throw "Failed to start RDP connection. Command: mstsc.exe `"$expandedRdpFile`"`n$($_.Exception.Message)"
-        }
+        $arguments += ConvertTo-RLauncherNativeArgument -Value $expandedRdpFile
     }
 
-    $hostName = Get-ObjectPropertyValue -InputObject $Profile -Name 'host'
-    if ([string]::IsNullOrWhiteSpace([string]$hostName)) {
-        throw "rdp profile requires rdpFile or host."
+    if ($PSBoundParameters.ContainsKey('HostName')) {
+        $port = Assert-Port -Port $Port -FieldName 'localPort'
+        $arguments += ConvertTo-RLauncherNativeArgument -Value ('/v:{0}:{1}' -f $HostName, $port)
     }
-
-    $settings = Get-ObjectPropertyValue -InputObject $Config -Name 'settings'
-    $defaultPort = Get-ObjectPropertyValue -InputObject $settings -Name 'defaultRdpPort'
-    $profilePort = Get-ObjectPropertyValue -InputObject $Profile -Name 'port'
-    $port = Resolve-ProfilePort -ProfilePort $profilePort -DefaultPort $defaultPort -FallbackPort 3389 -FieldName 'port'
-    $target = ('/v:{0}:{1}' -f $hostName, $port)
+    elseif ($arguments.Count -eq 0) {
+        $hostName = Get-ObjectPropertyValue -InputObject $Profile -Name 'host'
+        if ([string]::IsNullOrWhiteSpace([string]$hostName)) {
+            throw 'rdp profile requires rdpFile or host.'
+        }
+        $settings = Get-ObjectPropertyValue -InputObject $Config -Name 'settings'
+        $defaultPort = Get-ObjectPropertyValue -InputObject $settings -Name 'defaultRdpPort'
+        $profilePort = Get-ObjectPropertyValue -InputObject $Profile -Name 'port'
+        $port = Resolve-ProfilePort -ProfilePort $profilePort -DefaultPort $defaultPort -FallbackPort 3389 -FieldName 'port'
+        $arguments += ConvertTo-RLauncherNativeArgument -Value ('/v:{0}:{1}' -f $hostName, $port)
+    }
 
     try {
-        Start-Process -FilePath 'mstsc.exe' -ArgumentList @($target)
+        Write-Verbose ("Starting RDP: mstsc.exe {0}" -f ($arguments -join ' '))
+        # Start-Process -Wait also waits for descendants on Windows.
+        Start-Process -FilePath 'mstsc.exe' -ArgumentList $arguments -Wait:$Wait -ErrorAction Stop
     }
     catch {
-        throw "Failed to start RDP connection. Command: mstsc.exe $target`n$($_.Exception.Message)"
+        throw "Failed to start RDP connection. Command: mstsc.exe $($arguments -join ' ')`n$($_.Exception.Message)"
     }
 }
 
@@ -680,10 +731,10 @@ function Validate-RemoteProfileConfig {
                 $passwdFile = Get-ObjectPropertyValue -InputObject $profile -Name 'passwdFile'
                 $results += Test-RLauncherPathExistsForValidation -Path $passwdFile -Field 'passwdFile' -ProfileName $name -MissingMessage 'passwdFile does not exist:'
             }
-            'vnc-tunnel' {
+            { $_ -in @('vnc-tunnel', 'rdp-tunnel') } {
                 $sshHost = Get-ObjectPropertyValue -InputObject $profile -Name 'sshHost'
                 if ([string]::IsNullOrWhiteSpace([string]$sshHost)) {
-                    $results += New-ValidationResult -Level 'Error' -ProfileName $name -Field 'sshHost' -Message 'vnc-tunnel profile requires sshHost.'
+                    $results += New-ValidationResult -Level 'Error' -ProfileName $name -Field 'sshHost' -Message "$type profile requires sshHost."
                 }
                 $sshPort = Get-ObjectPropertyValue -InputObject $profile -Name 'sshPort'
                 if ($null -ne $sshPort -and [string]$sshPort -ne '') {
@@ -705,7 +756,7 @@ function Validate-RemoteProfileConfig {
                 }
                 $localPort = Get-ObjectPropertyValue -InputObject $profile -Name 'localPort'
                 if ([string]::IsNullOrWhiteSpace([string]$localPort)) {
-                    $results += New-ValidationResult -Level 'Error' -ProfileName $name -Field 'localPort' -Message 'vnc-tunnel profile requires localPort.'
+                    $results += New-ValidationResult -Level 'Error' -ProfileName $name -Field 'localPort' -Message "$type profile requires localPort."
                 }
                 else {
                     try {
@@ -726,14 +777,9 @@ function Validate-RemoteProfileConfig {
                         $results += New-ValidationResult -Level 'Error' -ProfileName $name -Field 'remotePort' -Message $_.Exception.Message
                     }
                 }
-                if (-not [string]::IsNullOrWhiteSpace([string]$localPort) -and $remotePortIsValid) {
-                    $effectiveRemotePort = $remotePort
-                    if ($null -eq $effectiveRemotePort -or [string]$effectiveRemotePort -eq '') {
-                        $settings = Get-ObjectPropertyValue -InputObject $Config -Name 'settings'
-                        $effectiveRemotePort = Get-ObjectPropertyValue -InputObject $settings -Name 'defaultVncPort' -Default 5900
-                    }
-
+                if ($type -eq 'vnc-tunnel' -and -not [string]::IsNullOrWhiteSpace([string]$localPort) -and $remotePortIsValid) {
                     try {
+                        $effectiveRemotePort = Resolve-TunnelRemotePort -Config $Config -Profile $profile
                         $localPortNumber = Assert-Port -Port $localPort -FieldName 'localPort'
                         $remotePortNumber = Assert-Port -Port $effectiveRemotePort -FieldName 'remotePort'
                         if ($localPortNumber -ne $remotePortNumber) {
@@ -745,10 +791,20 @@ function Validate-RemoteProfileConfig {
                     catch {
                     }
                 }
+                if ($type -eq 'rdp-tunnel') {
+                    $rdpFile = Get-ObjectPropertyValue $profile 'rdpFile'
+                    $results += Test-RLauncherPathExistsForValidation -Path $rdpFile -Field 'rdpFile' -ProfileName $name -MissingMessage 'rdpFile does not exist:'
+                    $remoteHost = Get-ObjectPropertyValue $profile 'remoteHost' -Default '127.0.0.1'
+                    if ([string]::IsNullOrWhiteSpace([string]$remoteHost)) {
+                        $results += New-ValidationResult -Level 'Error' -ProfileName $name -Field 'remoteHost' -Message 'remoteHost must not be empty.'
+                    }
+                }
                 $identityFile = Get-ObjectPropertyValue -InputObject $profile -Name 'identityFile'
                 $results += Test-RLauncherPathExistsForValidation -Path $identityFile -Field 'identityFile' -ProfileName $name -MissingMessage 'identityFile does not exist:'
-                $passwdFile = Get-ObjectPropertyValue -InputObject $profile -Name 'passwdFile'
-                $results += Test-RLauncherPathExistsForValidation -Path $passwdFile -Field 'passwdFile' -ProfileName $name -MissingMessage 'passwdFile does not exist:'
+                if ($type -eq 'vnc-tunnel') {
+                    $passwdFile = Get-ObjectPropertyValue -InputObject $profile -Name 'passwdFile'
+                    $results += Test-RLauncherPathExistsForValidation -Path $passwdFile -Field 'passwdFile' -ProfileName $name -MissingMessage 'passwdFile does not exist:'
+                }
             }
             default {
                 $results += New-ValidationResult -Level 'Error' -ProfileName $name -Field 'type' -Message "Unknown profile type: $type"
@@ -828,18 +884,18 @@ function Get-RLauncherProfileObject {
         elseif ([string]$type -eq 'vnc' -and [string]::IsNullOrWhiteSpace([string]$port)) {
             $port = Get-ObjectPropertyValue -InputObject $settings -Name 'defaultVncPort' -Default 5900
         }
-        elseif ([string]$type -eq 'vnc-tunnel') {
+        elseif ([string]$type -in @('vnc-tunnel', 'rdp-tunnel')) {
             $hostValue = Get-ObjectPropertyValue -InputObject $profile -Name 'remoteHost' -Default '127.0.0.1'
             $port = Get-ObjectPropertyValue -InputObject $profile -Name 'remotePort'
             if ([string]::IsNullOrWhiteSpace([string]$port)) {
-                $port = Get-ObjectPropertyValue -InputObject $settings -Name 'defaultVncPort' -Default 5900
+                $port = Resolve-TunnelRemotePort -Config $config -Profile $profile
             }
             $manageSshAgent = Resolve-ManageSshAgent -Config $config -Profile $profile
         }
 
-        $displayHost = if (-not [string]::IsNullOrWhiteSpace([string]$rdpFile)) { $rdpFile } else { $hostValue }
+        $displayHost = if ($type -eq 'rdp' -and -not [string]::IsNullOrWhiteSpace([string]$rdpFile)) { $rdpFile } else { $hostValue }
         if ($Short) {
-            if ([string]$type -eq 'vnc-tunnel') {
+            if ([string]$type -in @('vnc-tunnel', 'rdp-tunnel')) {
                 $displayHost = ('{0}({1})' -f $sshHost, $hostValue)
             }
 
@@ -903,6 +959,63 @@ function New-RLauncherProfileSample {
     Get-Item -LiteralPath $expandedPath -ErrorAction Stop
 }
 
+function Invoke-RLauncherTunnelConnection {
+    param(
+        [Parameter(Mandatory = $true)] [object] $Config,
+        [Parameter(Mandatory = $true)] [object] $Profile
+    )
+
+    $type = Get-ObjectPropertyValue $Profile 'type'
+    $remotePort = Resolve-TunnelRemotePort -Config $Config -Profile $Profile
+    $localPort = Assert-Port -Port (Get-ObjectPropertyValue $Profile 'localPort') -FieldName 'localPort'
+    $remoteHost = Get-ObjectPropertyValue $Profile 'remoteHost' -Default '127.0.0.1'
+    $sshHost = Get-ObjectPropertyValue $Profile 'sshHost'
+    $sshPort = Get-ObjectPropertyValue $Profile 'sshPort'
+    $forward = '{0}:{1}:{2}' -f $localPort, $remoteHost, $remotePort
+    if ($type -eq 'rdp-tunnel') { $forward = '127.0.0.1:' + $forward }
+    $context = "sshHost: $sshHost, sshPort: $sshPort, forwarding: -L $forward"
+    $sshWindowStyle = Resolve-SshWindowStyle -Config $Config -Profile $Profile
+    $identityFile = Get-ObjectPropertyValue $Profile 'identityFile'
+    $sshProcess = $null
+
+    Assert-RLauncherLocalPortAvailable -Port $localPort
+    if ($type -eq 'rdp-tunnel') { Ensure-Command -CommandName 'mstsc.exe' | Out-Null }
+    if (Resolve-ManageSshAgent -Config $Config -Profile $Profile) {
+        Ensure-SshAgent -IdentityFile $identityFile
+    }
+
+    try {
+        $sshProcess = Start-SshTunnel -Profile $Profile -RemotePort $remotePort -WindowStyle $sshWindowStyle
+        Start-Sleep -Milliseconds 300
+        if ($null -eq $sshProcess -or $sshProcess.HasExited) {
+            throw "SSH tunnel process exited before the client was started. $context"
+        }
+        if (-not (Wait-RLauncherTcpPort -HostName '127.0.0.1' -Port $localPort -TimeoutSeconds 10)) {
+            throw "SSH tunnel did not open 127.0.0.1:$localPort within 10 seconds. $context"
+        }
+        if ($sshProcess.HasExited) {
+            throw "SSH tunnel process exited after opening check and before the client was started. $context"
+        }
+
+        if ($type -eq 'rdp-tunnel') {
+            # The port can be claimed by another process while SSH authentication is pending.
+            $listeners = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $localPort -State Listen -ErrorAction Stop)
+            if (-not ($listeners | Where-Object { $_.OwningProcess -eq $sshProcess.Id })) {
+                throw "Local port 127.0.0.1:$localPort is not owned by the SSH tunnel process. $context"
+            }
+            Start-RdpConnection -Config $Config -Profile $Profile -HostName '127.0.0.1' -Port $localPort -Wait
+        }
+        else {
+            $null = Start-VncConnection -Config $Config -Profile $Profile -HostName '127.0.0.1' -Port $localPort -Wait
+        }
+    }
+    finally {
+        if ($null -ne $sshProcess -and -not $sshProcess.HasExited) {
+            Stop-Process -Id $sshProcess.Id -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Connect-RLauncher {
     [CmdletBinding()]
     param(
@@ -939,59 +1052,8 @@ function Connect-RLauncher {
             $port = Resolve-ProfilePort -ProfilePort $profilePort -DefaultPort $defaultPort -FallbackPort 5900 -FieldName 'port'
             $null = Start-VncConnection -Config $config -Profile $profile -HostName ([string]$hostName) -Port $port
         }
-        'vnc-tunnel' {
-            $settings = Get-ObjectPropertyValue -InputObject $config -Name 'settings'
-            $defaultPort = Get-ObjectPropertyValue -InputObject $settings -Name 'defaultVncPort'
-            $profileRemotePort = Get-ObjectPropertyValue -InputObject $profile -Name 'remotePort'
-            $remotePort = Resolve-ProfilePort -ProfilePort $profileRemotePort -DefaultPort $defaultPort -FallbackPort 5900 -FieldName 'remotePort'
-            $remoteHost = Get-ObjectPropertyValue -InputObject $profile -Name 'remoteHost' -Default '127.0.0.1'
-            $sshHost = Get-ObjectPropertyValue -InputObject $profile -Name 'sshHost'
-            if ([string]::IsNullOrWhiteSpace([string]$sshHost)) {
-                throw "vnc-tunnel profile requires sshHost."
-            }
-
-            $profileLocalPort = Get-ObjectPropertyValue -InputObject $profile -Name 'localPort'
-            if ([string]::IsNullOrWhiteSpace([string]$profileLocalPort)) {
-                throw "vnc-tunnel profile requires localPort."
-            }
-
-            $localPort = Assert-Port -Port $profileLocalPort -FieldName 'localPort'
-            $forward = ('{0}:{1}:{2}' -f $localPort, $remoteHost, $remotePort)
-            $identityFile = Get-ObjectPropertyValue -InputObject $profile -Name 'identityFile'
-            $sshProcess = $null
-            $sshPort = Get-ObjectPropertyValue -InputObject $profile -Name 'sshPort'
-            $sshWindowStyle = Resolve-SshWindowStyle -Config $config -Profile $profile
-
-            if (Resolve-ManageSshAgent -Config $config -Profile $profile) {
-                Ensure-SshAgent -IdentityFile $identityFile
-            }
-
-            try {
-                $sshProcess = Start-SshTunnel -Profile $profile -RemotePort $remotePort -WindowStyle $sshWindowStyle
-                Start-Sleep -Milliseconds 300
-
-                if ($sshProcess.HasExited) {
-                    throw "SSH tunnel process exited before VNC Viewer was started. sshHost: $sshHost, sshPort: $sshPort, forwarding: -L $forward"
-                }
-
-                if (-not (Wait-RLauncherTcpPort -HostName '127.0.0.1' -Port $localPort -TimeoutSeconds 10)) {
-                    throw "SSH tunnel did not open 127.0.0.1:$localPort within 10 seconds. sshHost: $sshHost, sshPort: $sshPort, forwarding: -L $forward"
-                }
-
-                if ($sshProcess.HasExited) {
-                    throw "SSH tunnel process exited after opening check and before VNC Viewer was started. sshHost: $sshHost, sshPort: $sshPort, forwarding: -L $forward"
-                }
-
-                $viewerProcess = Start-VncConnection -Config $config -Profile $profile -HostName '127.0.0.1' -Port $localPort
-                if ($null -ne $viewerProcess -and -not $viewerProcess.HasExited) {
-                    $viewerProcess.WaitForExit()
-                }
-            }
-            finally {
-                if ($null -ne $sshProcess -and -not $sshProcess.HasExited) {
-                    Stop-Process -Id $sshProcess.Id -ErrorAction SilentlyContinue
-                }
-            }
+        { $_ -in @('vnc-tunnel', 'rdp-tunnel') } {
+            Invoke-RLauncherTunnelConnection -Config $config -Profile $profile
         }
         default {
             if ([string]::IsNullOrWhiteSpace([string]$type)) {
